@@ -75,8 +75,8 @@ class SystemServer(LightroomServerModule):
                 Reconnection status
             """
             # Disconnect and reconnect
-            await client_manager.disconnect()
-            await client_manager.connect()
+            await resilient_client_manager.disconnect()
+            await resilient_client_manager.connect()
 
             return {
                 "status": "reconnected",
