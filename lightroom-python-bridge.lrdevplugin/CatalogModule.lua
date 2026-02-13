@@ -493,10 +493,11 @@ function CatalogModule.setSelectedPhotos(params, callback)
     
     -- Use withWriteAccessDo with timeout to prevent blocking
     local writeSuccess, writeError = ErrorUtils.safeCall(function()
+        local result
         catalog:withWriteAccessDo("Set Photo Selection", function()
             local photos = {}
             local notFound = {}
-            
+
             -- Find all photos by localIdentifier
             for _, photoId in ipairs(photoIds) do
                 local photo = catalog:getPhotoByLocalId(tonumber(photoId))
@@ -506,20 +507,21 @@ function CatalogModule.setSelectedPhotos(params, callback)
                     table.insert(notFound, photoId)
                 end
             end
-            
+
             if #photos == 0 then
                 error("No photos found with provided IDs")
             end
-            
+
             -- Set selection
             catalog:setSelectedPhotos(photos[1], photos)
-            
-            -- Return results for success callback
-            return {
+
+            -- Capture result via closure (withWriteAccessDo does not propagate return values)
+            result = {
                 selected = #photos,
                 notFound = #notFound > 0 and notFound or nil
             }
         end, { timeout = 10 })  -- 10 second timeout
+        return result
     end)
     
     if writeSuccess then
