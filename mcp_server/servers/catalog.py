@@ -377,6 +377,123 @@ class CatalogServer(LightroomServerModule):
             }
 
         @self.server.tool
+        async def catalog_create_smart_collection(
+            name: str,
+            search_desc_json: str,
+            parent_id: Optional[int] = None
+        ) -> Dict[str, Any]:
+            """
+            Create a smart collection with rule-based criteria.
+
+            search_desc_json is the same searchDesc shape Lightroom uses for
+            findPhotos. Pass through native LrC structure as JSON — do NOT
+            invent a parallel DSL.
+
+            Simple form (single criterion):
+                '{"criteria": "rating", "operation": ">=", "value": 3}'
+
+            Compound form (multiple criteria combined):
+                '{"criteria": [
+                    {"criteria": "keywords", "operation": "any", "value": "source:unclassified"},
+                    {"criteria": "captureTime", "operation": "inLast", "value": 90, "value_units": "days"}
+                ], "combine": "intersect"}'
+
+            Common criteria fields: rating, pickFlag, keywords, captureTime,
+            fileFormat, hasGPSData, label, folder, filename, dimensions.
+            Common operations: ==, !=, >=, <=, any, all, none, contains,
+            beginsWith, endsWith, inLast, isInRange.
+            Combine: "intersect" (AND), "union" (OR), "exclude" (NOT).
+
+            If a smart collection with this name already exists at the same
+            level, returns the existing one instead of erroring.
+
+            Args:
+                name: Name for the smart collection
+                search_desc_json: JSON-encoded searchDesc structure
+                parent_id: Optional parent collection set ID (None = top level)
+
+            Returns:
+                Created smart collection with id, name, type
+            """
+            import json
+            search_desc = json.loads(search_desc_json)
+            params = {"name": name, "searchDesc": search_desc}
+            if parent_id is not None:
+                params["parentId"] = parent_id
+            result = await self.execute_command("createSmartCollection", params)
+            return {"success": True, **result}
+
+        @self.server.tool
+        async def catalog_get_smart_collection_criteria(
+            collection_id: int
+        ) -> Dict[str, Any]:
+            """
+            Get a smart collection's search criteria (searchDesc).
+
+            Use catalog_get_collections first to discover collection IDs.
+
+            Args:
+                collection_id: localIdentifier of the smart collection
+
+            Returns:
+                {id, name, searchDesc} where searchDesc is the native LrC
+                criteria structure (suitable for round-trip into update)
+            """
+            result = await self.execute_command("getSmartCollectionCriteria", {
+                "collectionId": collection_id
+            })
+            return {"success": True, **result}
+
+        @self.server.tool
+        async def catalog_update_smart_collection(
+            collection_id: int,
+            search_desc_json: str
+        ) -> Dict[str, Any]:
+            """
+            Replace a smart collection's search criteria.
+
+            search_desc_json uses the same shape as catalog_create_smart_collection.
+            This is a full replacement, not a merge — the new criteria overwrite
+            the old completely.
+
+            Args:
+                collection_id: localIdentifier of the smart collection
+                search_desc_json: JSON-encoded searchDesc structure
+
+            Returns:
+                {id, name} of the updated collection
+            """
+            import json
+            search_desc = json.loads(search_desc_json)
+            result = await self.execute_command("updateSmartCollection", {
+                "collectionId": collection_id,
+                "searchDesc": search_desc
+            })
+            return {"success": True, **result}
+
+        @self.server.tool
+        async def catalog_delete_smart_collection(
+            collection_id: int
+        ) -> Dict[str, Any]:
+            """
+            Delete a smart collection.
+
+            Only works on smart collections. Use a different tool to delete
+            regular collections (this guards against accidental loss of
+            manually-curated collection contents).
+
+            Args:
+                collection_id: localIdentifier of the smart collection
+
+            Returns:
+                {id, name, deleted: true}
+            """
+            result = await self.execute_command("deleteSmartCollection", {
+                "collectionId": collection_id
+            })
+            return {"success": True, **result}
+
+        @self.server.tool
         async def catalog_get_folders() -> Dict[str, Any]:
             """
             Get all folders in the catalog.

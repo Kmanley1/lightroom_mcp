@@ -637,6 +637,194 @@ function CatalogModule.getCollections(params, callback)
     end)
 end
 
+-- Recursive walker: find a collection (smart or regular) by localIdentifier.
+-- Searches top-level child collections + descends into collection sets.
+local function findCollectionById(catalog, targetId)
+    local function walk(items)
+        for _, item in ipairs(items) do
+            if item.localIdentifier == targetId then
+                return item
+            end
+            -- Collection sets expose getChildCollections() and getChildCollectionSets()
+            if item.type and item:type() == "LrCollectionSet" then
+                local found = walk(item:getChildCollections())
+                if found then return found end
+                local foundInSet = walk(item:getChildCollectionSets())
+                if foundInSet then return foundInSet end
+            end
+        end
+        return nil
+    end
+    local hit = walk(catalog:getChildCollections())
+    if hit then return hit end
+    return walk(catalog:getChildCollectionSets())
+end
+
+-- Create a smart collection with searchDesc criteria.
+-- searchDesc: same shape as catalog:findPhotos {searchDesc=...}
+--   simple form: { criteria = "rating", operation = ">=", value = 3 }
+--   compound:    { criteria = { {...}, {...} }, combine = "intersect" }
+function CatalogModule.createSmartCollection(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local name = params and params.name
+    local searchDesc = params and params.searchDesc
+    local parentId = params and tonumber(params.parentId)
+
+    if type(name) ~= "string" or name == "" then
+        callback({ error = { code = "MISSING_PARAM", message = "name is required" } })
+        return
+    end
+    if type(searchDesc) ~= "table" then
+        callback({ error = { code = "MISSING_PARAM", message = "searchDesc is required (object)" } })
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+
+    catalog:withWriteAccessDo("Create Smart Collection", function()
+        local parent = nil
+        if parentId then
+            parent = findCollectionById(catalog, parentId)
+            if not parent then
+                callback({ error = { code = "PHOTO_NOT_FOUND", message = "Parent collection set not found: " .. parentId } })
+                return
+            end
+        end
+
+        -- 4th arg is `returnExisting`: if a smart collection with the same name
+        -- exists at this level, return it instead of erroring.
+        local sc = catalog:createSmartCollection(name, searchDesc, parent, true)
+        if not sc then
+            callback({ error = { code = "HANDLER_ERROR", message = "createSmartCollection returned nil" } })
+            return
+        end
+
+        logger:info("Created smart collection: " .. name .. " (id=" .. sc.localIdentifier .. ")")
+        callback({
+            result = {
+                id = sc.localIdentifier,
+                name = sc:getName(),
+                type = sc:type()
+            }
+        })
+    end)
+end
+
+-- Get a smart collection's searchDesc criteria.
+function CatalogModule.getSmartCollectionCriteria(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local collectionId = params and tonumber(params.collectionId)
+    if not collectionId then
+        callback({ error = { code = "MISSING_PARAM", message = "collectionId is required" } })
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+
+    catalog:withReadAccessDo(function()
+        local sc = findCollectionById(catalog, collectionId)
+        if not sc then
+            callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
+            return
+        end
+        if sc:type() ~= "LrSmartCollection" then
+            callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection (type=" .. sc:type() .. ")" } })
+            return
+        end
+
+        local searchDesc = sc:getSearchDescription()
+        callback({
+            result = {
+                id = sc.localIdentifier,
+                name = sc:getName(),
+                searchDesc = searchDesc
+            }
+        })
+    end)
+end
+
+-- Update a smart collection's searchDesc criteria.
+function CatalogModule.updateSmartCollection(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local collectionId = params and tonumber(params.collectionId)
+    local searchDesc = params and params.searchDesc
+
+    if not collectionId then
+        callback({ error = { code = "MISSING_PARAM", message = "collectionId is required" } })
+        return
+    end
+    if type(searchDesc) ~= "table" then
+        callback({ error = { code = "MISSING_PARAM", message = "searchDesc is required (object)" } })
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+
+    catalog:withWriteAccessDo("Update Smart Collection", function()
+        local sc = findCollectionById(catalog, collectionId)
+        if not sc then
+            callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
+            return
+        end
+        if sc:type() ~= "LrSmartCollection" then
+            callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection" } })
+            return
+        end
+
+        sc:setSearchDescription(searchDesc)
+        logger:info("Updated smart collection: " .. sc:getName() .. " (id=" .. collectionId .. ")")
+        callback({
+            result = {
+                id = collectionId,
+                name = sc:getName()
+            }
+        })
+    end)
+end
+
+-- Delete a smart collection.
+function CatalogModule.deleteSmartCollection(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local collectionId = params and tonumber(params.collectionId)
+    if not collectionId then
+        callback({ error = { code = "MISSING_PARAM", message = "collectionId is required" } })
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+
+    catalog:withWriteAccessDo("Delete Smart Collection", function()
+        local sc = findCollectionById(catalog, collectionId)
+        if not sc then
+            callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
+            return
+        end
+        if sc:type() ~= "LrSmartCollection" then
+            callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection (use a different tool to delete regular collections)" } })
+            return
+        end
+
+        local name = sc:getName()
+        sc:delete()
+        logger:info("Deleted smart collection: " .. name .. " (id=" .. collectionId .. ")")
+        callback({
+            result = {
+                id = collectionId,
+                name = name,
+                deleted = true
+            }
+        })
+    end)
+end
+
 -- Add keywords to a photo
 function CatalogModule.addPhotoKeywords(params, callback)
     ensureLrModules()
