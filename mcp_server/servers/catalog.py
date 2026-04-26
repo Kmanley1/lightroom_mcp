@@ -234,10 +234,153 @@ class CatalogServer(LightroomServerModule):
             }
         
         @self.server.tool
+        async def catalog_get_keyword_tree(
+            include_counts: bool = False,
+            max_depth: int = 10
+        ) -> Dict[str, Any]:
+            """
+            Get the full keyword hierarchy as a nested tree.
+
+            Returns all keywords with parent-child nesting.
+            Use include_counts=True for photo counts per keyword (slower).
+
+            Args:
+                include_counts: Include photo count per keyword (default False)
+                max_depth: Maximum nesting depth (default 10)
+
+            Returns:
+                Nested keyword tree with id, name, children, and optional photoCount
+            """
+            result = await self.execute_command("getKeywordTree", {
+                "includeCounts": include_counts,
+                "maxDepth": max_depth
+            })
+
+            return {
+                "success": True,
+                "top_level_count": result.get("topLevelCount", 0),
+                "total_count": result.get("totalCount", 0),
+                "keywords": result.get("keywords", [])
+            }
+
+        @self.server.tool
+        async def catalog_create_keyword(
+            keyword_name: str,
+            parent_id: Optional[int] = None,
+            dry_run: bool = True
+        ) -> Dict[str, Any]:
+            """
+            Create a keyword in the catalog hierarchy.
+
+            Creates under a parent keyword if parent_id is provided,
+            otherwise at top level. Returns existing keyword if name
+            already exists at that level. Dry run by default.
+
+            Args:
+                keyword_name: Name for the new keyword
+                parent_id: Parent keyword ID (from get_keyword_tree). None = top level
+                dry_run: If True, report what would happen (default True)
+
+            Returns:
+                Created keyword with id, name, parent info
+            """
+            params = {"keywordName": keyword_name, "dryRun": dry_run}
+            if parent_id is not None:
+                params["parentId"] = parent_id
+            result = await self.execute_command("createKeyword", params)
+            return {"success": True, **result}
+
+        @self.server.tool
+        async def catalog_batch_stamp_by_path(
+            items_json: str,
+            dry_run: bool = True
+        ) -> Dict[str, Any]:
+            """
+            Batch stamp keywords on photos found by file path.
+
+            Takes a JSON array of items, each with 'path' and 'keywords'.
+            Finds each photo by path and applies the keywords. Dry run by default.
+
+            Args:
+                items_json: JSON array of {path: string, keywords: string[]}
+                    e.g. '[{"path":"C:/Photos/2004/photo.jpg","keywords":["Dads Collection","Trips"]}]'
+                dry_run: If True, check which photos exist without stamping (default True)
+
+            Returns:
+                Count of stamped, not found, and errored photos
+            """
+            import json
+            items = json.loads(items_json)
+            result = await self.execute_command("batchStampByPath", {
+                "items": items,
+                "dryRun": dry_run
+            })
+            return {"success": True, **result}
+
+        @self.server.tool
+        async def catalog_batch_stamp_from_file(
+            manifest_path: str,
+            chunk_size: int = 100,
+            skip: int = 0,
+            dry_run: bool = True
+        ) -> Dict[str, Any]:
+            """
+            Batch stamp keywords from a JSON manifest file.
+
+            Reads a JSON array of {path, keywords} from a file and processes
+            in chunks. Use skip to resume after partial completion.
+
+            Args:
+                manifest_path: Path to JSON manifest file
+                chunk_size: Items per batch (default 100)
+                skip: Number of items to skip from start (default 0)
+                dry_run: If True, check without stamping (default True)
+
+            Returns:
+                Aggregate counts of stamped, not found, and errored photos
+            """
+            import json
+
+            with open(manifest_path, "r") as f:
+                all_items = json.load(f)
+
+            items = all_items[skip:]
+            total = len(items)
+            chunks = [items[i:i + chunk_size] for i in range(0, total, chunk_size)]
+
+            totals = {"stamped": 0, "notFound": 0, "errors": 0}
+            chunk_results = []
+
+            for i, chunk in enumerate(chunks):
+                result = await self.execute_command("batchStampByPath", {
+                    "items": chunk,
+                    "dryRun": dry_run
+                })
+                totals["stamped"] += result.get("stamped", 0)
+                totals["notFound"] += result.get("notFound", 0)
+                totals["errors"] += result.get("errors", 0)
+                chunk_results.append({
+                    "chunk": i + 1,
+                    "stamped": result.get("stamped", 0),
+                    "notFound": result.get("notFound", 0),
+                    "errors": result.get("errors", 0)
+                })
+
+            return {
+                "success": True,
+                "dry_run": dry_run,
+                "total_items": total,
+                "chunks_processed": len(chunks),
+                "skipped": skip,
+                **totals,
+                "chunk_details": chunk_results
+            }
+
+        @self.server.tool
         async def catalog_get_folders() -> Dict[str, Any]:
             """
             Get all folders in the catalog.
-            
+
             For AI agents to understand folder organization.
             
             Returns:

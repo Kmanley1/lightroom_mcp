@@ -1218,6 +1218,253 @@ function CatalogModule.getKeywords(params, callback)
     end)
 end
 
+-- Get full keyword hierarchy as a tree
+function CatalogModule.getKeywordTree(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local includeCounts = (params and params.includeCounts) or false
+    local maxDepth = (params and params.maxDepth) or 10
+
+    logger:info("Getting keyword tree (counts=" .. tostring(includeCounts) .. ", maxDepth=" .. maxDepth .. ")")
+
+    local catalog = LrApplication.activeCatalog()
+
+    catalog:withReadAccessDo(function()
+        local function buildTree(keywords, depth)
+            if depth > maxDepth then return {} end
+            local result = {}
+            for _, kw in ipairs(keywords) do
+                local node = {
+                    id = kw.localIdentifier,
+                    name = kw:getName()
+                }
+                if includeCounts then
+                    node.photoCount = #kw:getPhotos()
+                end
+                local children = kw:getChildren()
+                if children and #children > 0 then
+                    node.children = buildTree(children, depth + 1)
+                end
+                table.insert(result, node)
+            end
+            return result
+        end
+
+        local topLevel = catalog:getKeywords()
+        local tree = buildTree(topLevel, 1)
+
+        -- Count total keywords in tree
+        local function countNodes(nodes)
+            local count = 0
+            for _, node in ipairs(nodes) do
+                count = count + 1
+                if node.children then
+                    count = count + countNodes(node.children)
+                end
+            end
+            return count
+        end
+
+        local totalCount = countNodes(tree)
+        logger:info("Keyword tree: " .. #tree .. " top-level, " .. totalCount .. " total")
+
+        callback({
+            result = {
+                keywords = tree,
+                topLevelCount = #tree,
+                totalCount = totalCount
+            }
+        })
+    end)
+end
+
+-- Create a keyword in the hierarchy under an optional parent
+function CatalogModule.createKeyword(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local keywordName = params and params.keywordName
+    local parentId = params and params.parentId and tonumber(params.parentId)
+    local dryRun = (params and params.dryRun) or false
+
+    if not keywordName or keywordName == "" then
+        callback({ error = { code = "MISSING_PARAM", message = "keywordName is required" } })
+        return
+    end
+
+    logger:info("Create keyword: " .. keywordName .. " (parentId=" .. tostring(parentId) .. ", dryRun=" .. tostring(dryRun) .. ")")
+
+    local catalog = LrApplication.activeCatalog()
+    local parentKeyword = nil
+
+    -- Find parent keyword if specified
+    if parentId then
+        catalog:withReadAccessDo(function()
+            local function findById(keywords)
+                for _, kw in ipairs(keywords) do
+                    if kw.localIdentifier == parentId then
+                        return kw
+                    end
+                    local children = kw:getChildren()
+                    if children and #children > 0 then
+                        local found = findById(children)
+                        if found then return found end
+                    end
+                end
+                return nil
+            end
+            parentKeyword = findById(catalog:getKeywords())
+        end)
+
+        if not parentKeyword then
+            callback({ error = { code = "PARENT_NOT_FOUND", message = "Parent keyword not found: " .. parentId } })
+            return
+        end
+    end
+
+    if dryRun then
+        callback({
+            result = {
+                created = false,
+                dryRun = true,
+                keywordName = keywordName,
+                parentId = parentId,
+                parentName = parentKeyword and parentKeyword:getName() or nil,
+                message = "Would create keyword '" .. keywordName .. "'" ..
+                    (parentKeyword and (" under '" .. parentKeyword:getName() .. "'") or " at top level")
+            }
+        })
+        return
+    end
+
+    -- Create keyword (returns existing if already exists)
+    local createdKeyword = nil
+    catalog:withWriteAccessDo("Create Keyword", function()
+        createdKeyword = catalog:createKeyword(keywordName, {}, true, parentKeyword, true)
+    end)
+
+    if not createdKeyword then
+        callback({ error = { code = "CREATE_FAILED", message = "Failed to create keyword: " .. keywordName } })
+        return
+    end
+
+    -- Read keyword info in separate read block
+    local keywordId = nil
+    catalog:withReadAccessDo(function()
+        keywordId = createdKeyword.localIdentifier
+    end)
+
+    logger:info("Created keyword: " .. keywordName .. " (id=" .. tostring(keywordId) .. ")")
+    callback({
+        result = {
+            created = true,
+            keywordId = keywordId,
+            keywordName = keywordName,
+            parentId = parentId,
+            parentName = parentKeyword and parentKeyword:getName() or nil
+        }
+    })
+end
+
+-- Batch stamp keywords on photos found by file path
+function CatalogModule.batchStampByPath(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local items = params and params.items
+    local dryRun = (params and params.dryRun) or false
+
+    if not items or type(items) ~= "table" or #items == 0 then
+        callback({ error = { code = "MISSING_PARAM", message = "items array is required (each: {path, keywords})" } })
+        return
+    end
+
+    logger:info("Batch stamp: " .. #items .. " items (dryRun=" .. tostring(dryRun) .. ")")
+
+    local catalog = LrApplication.activeCatalog()
+    local results = { stamped = 0, notFound = 0, errors = 0, details = {} }
+
+    if dryRun then
+        -- Read-only: check which photos exist
+        catalog:withReadAccessDo(function()
+            for _, item in ipairs(items) do
+                local photo = catalog:findPhotoByPath(item.path, false)
+                if photo then
+                    results.stamped = results.stamped + 1
+                else
+                    results.notFound = results.notFound + 1
+                    table.insert(results.details, { path = item.path, status = "not_found" })
+                end
+            end
+        end)
+        results.dryRun = true
+        callback({ result = results })
+        return
+    end
+
+    -- Pre-resolve all unique keyword names to keyword objects (read block)
+    local allKwNames = {}
+    for _, item in ipairs(items) do
+        for _, kwName in ipairs(item.keywords) do
+            allKwNames[kwName] = true
+        end
+    end
+
+    local kwMap = {}  -- name -> keyword object
+    catalog:withReadAccessDo(function()
+        local function buildMap(keywords)
+            for _, kw in ipairs(keywords) do
+                local name = kw:getName()
+                if allKwNames[name] then
+                    kwMap[name] = kw
+                end
+                local children = kw:getChildren()
+                if children and #children > 0 then
+                    buildMap(children)
+                end
+            end
+        end
+        buildMap(catalog:getKeywords())
+    end)
+
+    logger:info("Pre-resolved " .. (function() local n=0; for _ in pairs(kwMap) do n=n+1 end; return n end)() .. " keywords")
+
+    -- Stamp photos with pre-resolved keywords (write block)
+    catalog:withWriteAccessDo("Batch Stamp Keywords", function()
+        for _, item in ipairs(items) do
+            local photo = catalog:findPhotoByPath(item.path, false)
+            if photo then
+                local ok = true
+                for _, kwName in ipairs(item.keywords) do
+                    local keyword = kwMap[kwName]
+                    if not keyword then
+                        -- Create at top level if not pre-resolved
+                        keyword = catalog:createKeyword(kwName, {}, true, nil, true)
+                    end
+
+                    if keyword then
+                        photo:addKeyword(keyword)
+                    else
+                        ok = false
+                        logger:warn("Failed to find/create keyword: " .. kwName)
+                    end
+                end
+                if ok then
+                    results.stamped = results.stamped + 1
+                else
+                    results.errors = results.errors + 1
+                end
+            else
+                results.notFound = results.notFound + 1
+            end
+        end
+    end)
+
+    logger:info("Batch stamp complete: " .. results.stamped .. " stamped, " .. results.notFound .. " not found, " .. results.errors .. " errors")
+    callback({ result = results })
+end
+
 -- Get folders in catalog
 function CatalogModule.getFolders(params, callback)
     ensureLrModules()
