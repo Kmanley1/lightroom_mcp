@@ -1117,68 +1117,61 @@ function CatalogModule.batchDeleteKeywords(params, callback)
 
     local catalog = LrApplication.activeCatalog()
 
-    -- Find all keywords by ID (read access)
-    local toDelete = {}
-    catalog:withReadAccessDo(function()
-        local allKeywords = catalog:getKeywords()
-        local idSet = {}
-        for _, id in ipairs(keywordIds) do
-            idSet[tonumber(id)] = true
-        end
-        for _, kw in ipairs(allKeywords) do
-            if idSet[kw.localIdentifier] then
-                table.insert(toDelete, {
-                    keyword = kw,
-                    name = kw:getName(),
-                    id = kw.localIdentifier
-                })
-            end
-        end
-    end)
-
-    logger:info("Batch delete: " .. #toDelete .. " of " .. #keywordIds .. " keywords found (dryRun=" .. tostring(dryRun) .. ")")
-
-    if dryRun then
-        local names = {}
-        for _, kw in ipairs(toDelete) do
-            table.insert(names, kw.name)
-        end
-        callback({
-            result = {
-                deleted = 0,
-                dryRun = true,
-                found = #toDelete,
-                requested = #keywordIds,
-                keywords = names
-            }
-        })
-        return
+    -- Build ID lookup set
+    local idSet = {}
+    for _, id in ipairs(keywordIds) do
+        idSet[tonumber(id)] = true
     end
 
-    -- Delete in one write access call
+    -- Find and optionally delete keywords in a single write access call
+    -- (keeping keyword objects inside the same access block where they're used)
+    local found = 0
     local deleted = 0
+    local names = {}
+
     catalog:withWriteAccessDo("Batch Delete Keywords", function()
-        for _, kw in ipairs(toDelete) do
-            local success, err = LrTasks.pcall(function()
-                catalog:deleteKeyword(kw.keyword)
-            end)
-            if success then
-                deleted = deleted + 1
-            else
-                logger:error("Failed to delete keyword: " .. kw.name .. " — " .. tostring(err))
+        local allKeywords = catalog:getKeywords()
+        for _, kw in ipairs(allKeywords) do
+            if idSet[kw.localIdentifier] then
+                found = found + 1
+                local kwName = kw:getName()
+                table.insert(names, kwName)
+
+                if not dryRun then
+                    local success, err = LrTasks.pcall(function()
+                        catalog:deleteKeyword(kw)
+                    end)
+                    if success then
+                        deleted = deleted + 1
+                    else
+                        logger:error("Failed to delete keyword: " .. kwName .. " — " .. tostring(err))
+                    end
+                end
             end
         end
+
+        logger:info("Batch delete: found=" .. found .. " deleted=" .. deleted .. " dryRun=" .. tostring(dryRun))
+
+        if dryRun then
+            callback({
+                result = {
+                    deleted = 0,
+                    dryRun = true,
+                    found = found,
+                    requested = #keywordIds,
+                    keywords = names
+                }
+            })
+        else
+            callback({
+                result = {
+                    deleted = deleted,
+                    requested = #keywordIds,
+                    found = found
+                }
+            })
+        end
     end)
-
-    logger:info("Batch deleted: " .. deleted .. " keywords")
-
-    callback({
-        result = {
-            deleted = deleted,
-            requested = #keywordIds,
-            found = #toDelete
-        }
-    })
 end
 
 -- Get keywords in catalog (with pagination and optional photo counts)

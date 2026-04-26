@@ -460,7 +460,7 @@ class CatalogServer(LightroomServerModule):
 
         @self.server.tool
         async def catalog_batch_delete_keywords(
-            keyword_ids: List[int],
+            keyword_ids_csv: str,
             dry_run: bool = True
         ) -> Dict[str, Any]:
             """
@@ -468,17 +468,18 @@ class CatalogServer(LightroomServerModule):
             Dry run by default. Use for cleanup passes.
 
             Args:
-                keyword_ids: List of keyword IDs to delete
+                keyword_ids_csv: Comma-separated keyword IDs (e.g., "16735,16810,16839")
                 dry_run: If True, report what would happen (default True)
 
             Returns:
                 Count of deleted keywords
             """
+            keyword_ids = [int(x.strip()) for x in keyword_ids_csv.split(",") if x.strip()]
             result = await self.execute_command("batchDeleteKeywords", {
                 "keywordIds": keyword_ids,
                 "dryRun": dry_run
             })
-            return {"success": True, "dry_run": dry_run, **result}
+            return {"success": True, "dry_run": dry_run, "requested": len(keyword_ids), **result}
 
         @self.server.tool
         async def catalog_get_photo_info(
