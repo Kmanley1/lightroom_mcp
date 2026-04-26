@@ -27,9 +27,15 @@ pip install -r requirements.txt
 
 **Run Tests**:
 ```bash
-python -m pytest lightroom_sdk/tests/
+python -m pytest tests/                        # all tests
+python -m pytest tests/ -m unit                # unit only (no Lightroom required)
+python -m pytest tests/ -m integration         # integration (requires LR + bridge)
 python -c "from mcp_server.main import main_server; print('Server loaded successfully')"
 ```
+
+Tests live in `tests/` (per `pytest.ini`). Markers: `unit` (pure Python,
+runs anywhere), `integration` (requires Lightroom Classic running with
+the Python Bridge plugin started).
 
 **Lightroom Plugin Setup**:
 1. Plugin must be installed in Lightroom first (`File → Plug-in Manager → Add`)
