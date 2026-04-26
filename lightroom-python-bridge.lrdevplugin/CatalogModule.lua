@@ -117,14 +117,102 @@ function CatalogModule.searchPhotos(params, callback)
             }, "No photos found in catalog"))
             return
         end
-        
+
+        -- Apply criteria filter (criteria was previously extracted but never used).
+        -- Filters: keyword (name match), rating.min/max, fileFormat (JPEG normalized
+        -- to JPG, case-insensitive), captureDate.after/before (YYYY-MM-DD).
+        local matched
+        if not criteria or not next(criteria) then
+            matched = allPhotos
+        else
+            matched = {}
+
+            -- Normalize fileFormat once
+            local fmtFilter = nil
+            if criteria.fileFormat and criteria.fileFormat ~= "" then
+                local upper = string.upper(criteria.fileFormat)
+                if upper == "JPEG" then upper = "JPG" end
+                fmtFilter = upper
+            end
+
+            -- Parse date strings to Cocoa time once
+            local dateAfter, dateBefore = nil, nil
+            if criteria.captureDate then
+                local LrDate = import 'LrDate'
+                if criteria.captureDate.after then
+                    local y, mo, d = criteria.captureDate.after:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+                    if y then
+                        dateAfter = LrDate.timeFromComponents(tonumber(y), tonumber(mo), tonumber(d), 0, 0, 0, "local")
+                    end
+                end
+                if criteria.captureDate.before then
+                    local y, mo, d = criteria.captureDate.before:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+                    if y then
+                        dateBefore = LrDate.timeFromComponents(tonumber(y), tonumber(mo), tonumber(d), 23, 59, 59, "local")
+                    end
+                end
+            end
+
+            for _, photo in ipairs(allPhotos) do
+                local include = true
+
+                if include and fmtFilter then
+                    local f = photo:getRawMetadata("fileFormat")
+                    if not f or string.upper(tostring(f)) ~= fmtFilter then
+                        include = false
+                    end
+                end
+
+                if include and criteria.rating then
+                    local rating = photo:getRawMetadata("rating") or 0
+                    if criteria.rating.min and rating < criteria.rating.min then
+                        include = false
+                    end
+                    if include and criteria.rating.max and rating > criteria.rating.max then
+                        include = false
+                    end
+                end
+
+                if include and (dateAfter or dateBefore) then
+                    local captureTime = photo:getRawMetadata("dateTimeOriginal")
+                    if not captureTime then
+                        include = false
+                    else
+                        if dateAfter and captureTime < dateAfter then include = false end
+                        if include and dateBefore and captureTime > dateBefore then include = false end
+                    end
+                end
+
+                if include and criteria.keyword and criteria.keyword ~= "" then
+                    local found = false
+                    local keywords = photo:getRawMetadata("keywords")
+                    if keywords then
+                        for _, kw in ipairs(keywords) do
+                            local ok, name = ErrorUtils.safeCall(function()
+                                return kw:getName()
+                            end)
+                            if ok and name == criteria.keyword then
+                                found = true
+                                break
+                            end
+                        end
+                    end
+                    if not found then include = false end
+                end
+
+                if include then
+                    table.insert(matched, photo)
+                end
+            end
+        end
+
         local results = {}
-        local total = #allPhotos
+        local total = #matched
         local startIndex = offset + 1
         local endIndex = math.min(offset + limit, total)
-        
+
         for i = startIndex, endIndex do
-            local photo = allPhotos[i]
+            local photo = matched[i]
             
             local photoData = {
                 id = photo.localIdentifier,

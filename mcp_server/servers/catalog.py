@@ -114,13 +114,19 @@ class CatalogServer(LightroomServerModule):
             Powerful search for AI agents to find specific photos.
 
             Args:
-                keyword: Search by keyword name
-                rating_min: Minimum star rating (1-5)
-                rating_max: Maximum star rating (1-5)
-                file_format: Filter by format (RAW, JPEG, etc.)
-                date_after: Photos after this date (YYYY-MM-DD)
-                date_before: Photos before this date (YYYY-MM-DD)
+                keyword: Search by exact keyword name (case-sensitive)
+                rating_min: Minimum star rating (0-5)
+                rating_max: Maximum star rating (0-5)
+                file_format: LrC fileFormat value — one of RAW, DNG, JPG,
+                    TIFF, PSD, VIDEO. JPEG is auto-normalized to JPG.
+                    Case-insensitive. Note: RAW covers all camera RAW
+                    formats (NEF, CR2, ARW, etc.) — LrC normalizes them.
+                date_after: Photos with dateTimeOriginal on or after this date (YYYY-MM-DD)
+                date_before: Photos with dateTimeOriginal on or before this date (YYYY-MM-DD)
                 limit: Maximum results (default 100)
+
+            Note: search runs against the current target selection if any
+            photos are selected in LrC, otherwise against the full catalog.
 
             Returns:
                 Matching photos
