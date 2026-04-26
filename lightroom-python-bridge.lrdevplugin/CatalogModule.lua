@@ -683,30 +683,45 @@ function CatalogModule.createSmartCollection(params, callback)
 
     local catalog = LrApplication.activeCatalog()
 
-    catalog:withWriteAccessDo("Create Smart Collection", function()
-        local parent = nil
-        if parentId then
-            parent = findCollectionById(catalog, parentId)
-            if not parent then
-                callback({ error = { code = "PHOTO_NOT_FOUND", message = "Parent collection set not found: " .. parentId } })
-                return
-            end
-        end
-
-        -- 4th arg is `returnExisting`: if a smart collection with the same name
-        -- exists at this level, return it instead of erroring.
-        local sc = catalog:createSmartCollection(name, searchDesc, parent, true)
-        if not sc then
-            callback({ error = { code = "HANDLER_ERROR", message = "createSmartCollection returned nil" } })
+    -- Resolve parent (read-only) before opening the write block.
+    local parent = nil
+    if parentId then
+        local found
+        catalog:withReadAccessDo(function()
+            found = findCollectionById(catalog, parentId)
+        end)
+        if not found then
+            callback({ error = { code = "PHOTO_NOT_FOUND", message = "Parent collection set not found: " .. parentId } })
             return
         end
+        parent = found
+    end
 
-        logger:info("Created smart collection: " .. name .. " (id=" .. sc.localIdentifier .. ")")
+    -- LrC SDK constraint: cannot read localIdentifier/getName/type on a
+    -- newly-created collection inside the same withWriteAccessDo block.
+    -- Capture the reference in the write block, read its properties after.
+    local sc
+    catalog:withWriteAccessDo("Create Smart Collection", function()
+        -- 4th arg `returnExisting`: idempotent on duplicate name at same level.
+        sc = catalog:createSmartCollection(name, searchDesc, parent, true)
+    end)
+
+    if not sc then
+        callback({ error = { code = "HANDLER_ERROR", message = "createSmartCollection returned nil" } })
+        return
+    end
+
+    -- Read properties in a separate read block (write block has committed).
+    catalog:withReadAccessDo(function()
+        local id = sc.localIdentifier
+        local resolvedName = sc:getName()
+        local resolvedType = sc:type()
+        logger:info("Created smart collection: " .. resolvedName .. " (id=" .. tostring(id) .. ", type=" .. tostring(resolvedType) .. ")")
         callback({
             result = {
-                id = sc.localIdentifier,
-                name = sc:getName(),
-                type = sc:type()
+                id = id,
+                name = resolvedName,
+                type = resolvedType
             }
         })
     end)
@@ -731,8 +746,11 @@ function CatalogModule.getSmartCollectionCriteria(params, callback)
             callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
             return
         end
-        if sc:type() ~= "LrSmartCollection" then
-            callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection (type=" .. sc:type() .. ")" } })
+        -- LrC reports type "LrCollection" for both regular and smart collections;
+        -- use isSmartCollection() to differentiate.
+        local isSmart = sc.isSmartCollection and sc:isSmartCollection() or false
+        if not isSmart then
+            callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection" } })
             return
         end
 
@@ -772,7 +790,8 @@ function CatalogModule.updateSmartCollection(params, callback)
             callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
             return
         end
-        if sc:type() ~= "LrSmartCollection" then
+        local isSmart = sc.isSmartCollection and sc:isSmartCollection() or false
+        if not isSmart then
             callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection" } })
             return
         end
@@ -807,7 +826,8 @@ function CatalogModule.deleteSmartCollection(params, callback)
             callback({ error = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. collectionId } })
             return
         end
-        if sc:type() ~= "LrSmartCollection" then
+        local isSmart = sc.isSmartCollection and sc:isSmartCollection() or false
+        if not isSmart then
             callback({ error = { code = "INVALID_PARAM_VALUE", message = "Collection " .. collectionId .. " is not a smart collection (use a different tool to delete regular collections)" } })
             return
         end
