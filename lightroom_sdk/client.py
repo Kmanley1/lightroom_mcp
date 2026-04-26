@@ -38,7 +38,7 @@ class LightroomClient:
         self,
         command: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 30.0
+        timeout: float = 120.0
     ) -> Dict[str, Any]:
         """Execute a command and handle response"""
         response = await self._bridge.send_command(command, params, timeout)

@@ -197,7 +197,7 @@ class SocketBridge:
         self,
         command: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 30.0
+        timeout: float = 120.0
     ) -> Dict[str, Any]:
         """Send command and await response"""
         if not self._connected:
