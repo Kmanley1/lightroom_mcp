@@ -804,6 +804,8 @@ class CatalogServer(LightroomServerModule):
             current_offset = start_offset
             batch_num = 0
             total_photos = 0
+            stamped_set_size = 0
+            source_keyword_count = 0
 
             while True:
                 if max_batches is not None and batch_num >= max_batches:
@@ -821,6 +823,10 @@ class CatalogServer(LightroomServerModule):
                 totals["scanned"] += cand_result.get("scanned", 0)
                 totals["skipped_has_source"] += cand_result.get("skippedHasSource", 0)
                 totals["skipped_virtual"] += cand_result.get("skippedVirtual", 0)
+                # Stamped-set metrics — same on every batch (catalog state is
+                # snapshotted at start of each call). Capture last-seen.
+                stamped_set_size = cand_result.get("stampedSetSize", 0)
+                source_keyword_count = cand_result.get("sourceKeywordCount", 0)
 
                 if not candidates:
                     if not has_more:
@@ -873,6 +879,8 @@ class CatalogServer(LightroomServerModule):
                 "classifier_version": CLASSIFIER_VERSION,
                 "batches_processed": batch_num,
                 "total_photos_in_catalog": total_photos,
+                "stamped_set_size": stamped_set_size,
+                "source_keyword_count": source_keyword_count,
                 "ended_at_offset": current_offset,
                 "more_remaining": current_offset < total_photos,
                 **totals,

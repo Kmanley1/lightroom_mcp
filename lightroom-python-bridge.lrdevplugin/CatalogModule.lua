@@ -2003,8 +2003,47 @@ function CatalogModule.getCandidatesForClassification(params, callback)
     local skippedVirtual = 0
     local nextOffset = offset
     local totalPhotos = 0
+    local stampedSetSize = 0
+    local sourceKeywordCount = 0
 
     catalog:withReadAccessDo(function()
+        -- OPTIMIZATION: build a "stamped set" of photo localIdentifiers by
+        -- unioning every source:* keyword's photo list. Then the per-photo
+        -- check in the walk is an O(1) table lookup instead of an N-keyword
+        -- metadata read. Trades one upfront keyword-tree walk + per-keyword
+        -- getPhotos() call for skipping the slow path on every photo.
+        --
+        -- For Ken's catalog (~25K photos, ~5.6K stamped) this collapses
+        -- the per-photo cost from ~10ms to ~50µs. See PROGRESS 2026-04-26.
+        local stampedSet = {}
+        local function collectSourceKeywords(keywords, into)
+            for _, kw in ipairs(keywords) do
+                local ok, name = ErrorUtils.safeCall(function() return kw:getName() end)
+                if ok and name and string.sub(name, 1, 7) == "source:" then
+                    table.insert(into, kw)
+                end
+                local children = kw:getChildren()
+                if children and #children > 0 then
+                    collectSourceKeywords(children, into)
+                end
+            end
+        end
+        local sourceKws = {}
+        collectSourceKeywords(catalog:getKeywords(), sourceKws)
+        sourceKeywordCount = #sourceKws
+
+        for _, kw in ipairs(sourceKws) do
+            local ok, photos = ErrorUtils.safeCall(function() return kw:getPhotos() end)
+            if ok and photos then
+                for _, p in ipairs(photos) do
+                    if not stampedSet[p.localIdentifier] then
+                        stampedSet[p.localIdentifier] = true
+                        stampedSetSize = stampedSetSize + 1
+                    end
+                end
+            end
+        end
+
         local allPhotos = catalog:getAllPhotos() or {}
         totalPhotos = #allPhotos
 
@@ -2014,17 +2053,17 @@ function CatalogModule.getCandidatesForClassification(params, callback)
             scanned = scanned + 1
             i = i + 1
 
-            -- Skip virtual copies — they share metadata with master, no
-            -- value in classifying separately (Phase 3 strategy decision 2).
-            local isVirtual = photo:getRawMetadata("isVirtualCopy")
-            if skipVirtualCopies and isVirtual then
-                skippedVirtual = skippedVirtual + 1
+            local pid = photo.localIdentifier
+
+            if stampedSet[pid] then
+                -- Already stamped (human-curated or prior classifier run).
+                skippedHasSource = skippedHasSource + 1
             else
-                local kwNames = getPhotoKeywordNames(photo)
-                if hasAnySourceKeyword(kwNames) then
-                    -- Already has a source:* keyword — either human-curated
-                    -- or stamped by a prior classifier run. Skip in v1.
-                    skippedHasSource = skippedHasSource + 1
+                -- Skip virtual copies — they share metadata with master, no
+                -- value in classifying separately (Phase 3 strategy decision 2).
+                local isVirtual = photo:getRawMetadata("isVirtualCopy")
+                if skipVirtualCopies and isVirtual then
+                    skippedVirtual = skippedVirtual + 1
                 else
                     -- Build candidate record. Read enough metadata for
                     -- classifier rules.
@@ -2084,6 +2123,8 @@ function CatalogModule.getCandidatesForClassification(params, callback)
         " scanned=" .. scanned ..
         " skippedHasSource=" .. skippedHasSource ..
         " skippedVirtual=" .. skippedVirtual ..
+        " stampedSetSize=" .. stampedSetSize ..
+        " sourceKeywordCount=" .. sourceKeywordCount ..
         " nextOffset=" .. nextOffset ..
         " totalPhotos=" .. totalPhotos)
 
@@ -2094,6 +2135,8 @@ function CatalogModule.getCandidatesForClassification(params, callback)
             scanned = scanned,
             skippedHasSource = skippedHasSource,
             skippedVirtual = skippedVirtual,
+            stampedSetSize = stampedSetSize,
+            sourceKeywordCount = sourceKeywordCount,
             nextOffset = nextOffset,
             totalPhotos = totalPhotos,
             hasMore = hasMore,
