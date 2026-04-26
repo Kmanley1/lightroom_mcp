@@ -748,6 +748,139 @@ class CatalogServer(LightroomServerModule):
             return {"success": True, "dry_run": dry_run, "requested": len(keyword_ids), **result}
 
         @self.server.tool
+        async def catalog_classify_unclassified(
+            batch_size: int = 50,
+            max_batches: Optional[int] = None,
+            dry_run: bool = True,
+            start_offset: int = 0
+        ) -> Dict[str, Any]:
+            """
+            Phase 3: classify photos without a source:* keyword and stamp them.
+
+            Walks the catalog in batches. For each batch: fetches candidates
+            (photos with no source:* keyword), runs the v1 rule-based classifier
+            in-process, and stamps the chosen source:* keyword + classifier:vN
+            via a single write block per batch.
+
+            Idempotent: re-running yields no candidates once everyone is stamped.
+            Respects "human > classifier" — any photo with an existing source:*
+            keyword is skipped.
+
+            Stack members and sibling pairs (RAW+JPEG) are mirrored — the master
+            is classified once, all members get the same stamp.
+
+            Args:
+                batch_size: Photos per batch (default 50). Tunable; revisit if
+                    memory or latency profile demands change.
+                max_batches: Cap total batches (None = run until catalog exhausted).
+                    Useful for first runs against a large catalog.
+                dry_run: If True, report what would be classified without writing
+                    (default True). Shows class distribution + would-create counts.
+                start_offset: Resume from this offset in the catalog walk
+                    (default 0). The handler returns next_offset so a stopped run
+                    can resume.
+
+            Returns:
+                Aggregate report: stamped, skipped, errors, mirrored,
+                keywords_created, class_distribution, batches_processed.
+            """
+            from mcp_server.classifier import (
+                CLASSIFIER_VERSION,
+                classify_batch,
+            )
+
+            totals = {
+                "stamped": 0,
+                "skipped": 0,
+                "errors": 0,
+                "mirrored": 0,
+                "keywords_created": 0,
+                "scanned": 0,
+                "skipped_has_source": 0,
+                "skipped_virtual": 0,
+            }
+            distribution: Dict[str, int] = {}
+            batches: List[Dict[str, Any]] = []
+            current_offset = start_offset
+            batch_num = 0
+            total_photos = 0
+
+            while True:
+                if max_batches is not None and batch_num >= max_batches:
+                    break
+
+                cand_result = await self.execute_command(
+                    "getCandidatesForClassification",
+                    {"limit": batch_size, "offset": current_offset},
+                )
+                candidates = cand_result.get("candidates", [])
+                next_offset = cand_result.get("nextOffset", current_offset)
+                has_more = cand_result.get("hasMore", False)
+                total_photos = cand_result.get("totalPhotos", total_photos)
+
+                totals["scanned"] += cand_result.get("scanned", 0)
+                totals["skipped_has_source"] += cand_result.get("skippedHasSource", 0)
+                totals["skipped_virtual"] += cand_result.get("skippedVirtual", 0)
+
+                if not candidates:
+                    if not has_more:
+                        break
+                    # No candidates in this slice but catalog has more — advance.
+                    current_offset = next_offset
+                    continue
+
+                classifications = classify_batch(candidates)
+                payload = []
+                for cand, cls in zip(candidates, classifications):
+                    payload.append({
+                        "photoId": cand["id"],
+                        "sourceKeyword": cls.source_keyword,
+                        "version": cls.version,
+                        "mirrors": cand.get("mirrors") or [],
+                    })
+                    distribution[cls.source_keyword] = distribution.get(cls.source_keyword, 0) + 1
+
+                apply_result = await self.execute_command(
+                    "applyClassification",
+                    {"classifications": payload, "dryRun": dry_run},
+                )
+
+                totals["stamped"] += apply_result.get("stamped", 0)
+                totals["skipped"] += apply_result.get("skipped", 0)
+                totals["errors"] += apply_result.get("errors", 0)
+                totals["mirrored"] += apply_result.get("mirrored", 0)
+                totals["keywords_created"] += apply_result.get("keywordsCreated", 0)
+
+                batches.append({
+                    "batch": batch_num + 1,
+                    "offset": current_offset,
+                    "next_offset": next_offset,
+                    "candidates": len(candidates),
+                    "stamped": apply_result.get("stamped", 0),
+                    "skipped": apply_result.get("skipped", 0),
+                    "errors": apply_result.get("errors", 0),
+                })
+
+                batch_num += 1
+                current_offset = next_offset
+
+                if not has_more:
+                    break
+
+            return {
+                "success": True,
+                "dry_run": dry_run,
+                "classifier_version": CLASSIFIER_VERSION,
+                "batches_processed": batch_num,
+                "total_photos_in_catalog": total_photos,
+                "ended_at_offset": current_offset,
+                "more_remaining": current_offset < total_photos,
+                **totals,
+                "class_distribution": distribution,
+                "batch_details": batches,
+            }
+
+        @self.server.tool
         async def catalog_get_photo_info(
             photo_id: Union[str, int]
         ) -> Dict[str, Any]:

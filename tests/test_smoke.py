@@ -46,3 +46,20 @@ def test_smart_collection_tools_defined():
     ]
     missing = [name for name in expected if f"def {name}" not in source]
     assert not missing, f"missing smart-collection tool definitions: {missing}"
+
+
+@pytest.mark.unit
+def test_phase3_classifier_imports():
+    """The Phase 3 classifier package must be importable."""
+    from mcp_server.classifier import classify_batch, CLASSIFIER_VERSION  # noqa: F401
+
+
+@pytest.mark.unit
+def test_phase3_orchestrator_tool_defined():
+    """Phase 3 orchestrator MCP tool must be defined in catalog.py."""
+    import inspect
+    from mcp_server.servers import catalog
+
+    source = inspect.getsource(catalog)
+    assert "def catalog_classify_unclassified" in source, \
+        "Phase 3 orchestrator tool catalog_classify_unclassified is missing"

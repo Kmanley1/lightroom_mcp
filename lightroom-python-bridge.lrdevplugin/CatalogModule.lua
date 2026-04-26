@@ -1928,4 +1928,351 @@ function CatalogModule.batchGetFormattedMetadata(params, callback)
     end)
 end
 
+-- ============================================================================
+-- Phase 3: Asset-aware classifier stamper
+-- ============================================================================
+-- See toolkit-lightroom-strategy-mcp-phase3.md for design decisions.
+-- The classifier itself lives in Python (mcp_server/classifier/). These
+-- handlers are the catalog-side primitives:
+--   getCandidatesForClassification — returns photos with no source:* keyword,
+--     with the metadata the classifier needs (path, EXIF, dims, stack info)
+--   applyClassification — applies pre-computed classifications in a single
+--     write block per call, with sibling-pair / Live Photo mirroring
+
+-- Internal: detect if a keyword name is in the classifier-managed namespace.
+-- Both source:* and classifier:* are flat colon-named keywords.
+local function isClassifierManagedKeyword(name)
+    if not name then return false end
+    return string.sub(name, 1, 7) == "source:" or
+           string.sub(name, 1, 11) == "classifier:"
+end
+
+-- Internal: does a list of keyword names contain any source:* entry?
+local function hasAnySourceKeyword(keywordNames)
+    for _, n in ipairs(keywordNames) do
+        if string.sub(n, 1, 7) == "source:" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Internal: extract keyword names from a photo's getRawMetadata("keywords")
+-- result. Wraps in safeCall so a single corrupt keyword doesn't blow up the
+-- whole batch.
+local function getPhotoKeywordNames(photo)
+    local names = {}
+    local kws = photo:getRawMetadata("keywords")
+    if not kws then return names end
+    for _, kw in ipairs(kws) do
+        local ok, name = ErrorUtils.safeCall(function() return kw:getName() end)
+        if ok and name then
+            table.insert(names, name)
+        end
+    end
+    return names
+end
+
+-- Get candidates for classification. A candidate is a photo with no
+-- source:* keyword (= unclaimed by either human curation or a prior
+-- classifier run). Returns enough metadata for the classifier plus
+-- stack/sibling grouping info so the orchestrator can apply mirroring.
+function CatalogModule.getCandidatesForClassification(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local limit = (params and tonumber(params.limit)) or 50
+    local offset = (params and tonumber(params.offset)) or 0
+    local skipVirtualCopies = true
+    if params and params.includeVirtualCopies then
+        skipVirtualCopies = false
+    end
+
+    if limit < 1 or limit > 1000 then
+        callback({ error = { code = "INVALID_PARAM_VALUE",
+            message = "limit must be 1..1000" } })
+        return
+    end
+
+    logger:info("getCandidatesForClassification: limit=" .. limit .. " offset=" .. offset)
+
+    local catalog = LrApplication.activeCatalog()
+    local candidates = {}
+    local scanned = 0
+    local skippedHasSource = 0
+    local skippedVirtual = 0
+    local nextOffset = offset
+    local totalPhotos = 0
+
+    catalog:withReadAccessDo(function()
+        local allPhotos = catalog:getAllPhotos() or {}
+        totalPhotos = #allPhotos
+
+        local i = offset + 1
+        while i <= totalPhotos and #candidates < limit do
+            local photo = allPhotos[i]
+            scanned = scanned + 1
+            i = i + 1
+
+            -- Skip virtual copies — they share metadata with master, no
+            -- value in classifying separately (Phase 3 strategy decision 2).
+            local isVirtual = photo:getRawMetadata("isVirtualCopy")
+            if skipVirtualCopies and isVirtual then
+                skippedVirtual = skippedVirtual + 1
+            else
+                local kwNames = getPhotoKeywordNames(photo)
+                if hasAnySourceKeyword(kwNames) then
+                    -- Already has a source:* keyword — either human-curated
+                    -- or stamped by a prior classifier run. Skip in v1.
+                    skippedHasSource = skippedHasSource + 1
+                else
+                    -- Build candidate record. Read enough metadata for
+                    -- classifier rules.
+                    local cand = {
+                        id = photo.localIdentifier,
+                    }
+                    ErrorUtils.safeCall(function()
+                        cand.path = photo:getRawMetadata("path")
+                        cand.fileFormat = photo:getRawMetadata("fileFormat")
+                        cand.cameraMake = photo:getRawMetadata("cameraMake")
+                        cand.cameraModel = photo:getRawMetadata("cameraModel")
+                        cand.software = photo:getFormattedMetadata("software")
+                        cand.isInStack = photo:getRawMetadata("isInStackInFolder")
+                        cand.stackPosition = photo:getRawMetadata("stackPositionInFolder")
+                        cand.isVirtualCopy = isVirtual
+                        local dims = photo:getRawMetadata("dimensions")
+                        if dims then
+                            cand.width = dims.width
+                            cand.height = dims.height
+                        end
+                    end)
+                    ErrorUtils.safeCall(function()
+                        cand.filename = photo:getFormattedMetadata("fileName")
+                    end)
+
+                    -- Build mirror list: stack members + un-stacked sibling
+                    -- pairs (RAW + JPEG with same basename in same folder).
+                    -- Master photo gets the stamp; mirrors get the same.
+                    local mirrors = {}
+                    if cand.isInStack then
+                        ErrorUtils.safeCall(function()
+                            local members = photo:getRawMetadata("stackInFolderMembers")
+                            if members then
+                                for _, m in ipairs(members) do
+                                    if m.localIdentifier ~= photo.localIdentifier then
+                                        local mIsVirtual = m:getRawMetadata("isVirtualCopy")
+                                        if not (skipVirtualCopies and mIsVirtual) then
+                                            table.insert(mirrors, m.localIdentifier)
+                                        end
+                                    end
+                                end
+                            end
+                        end)
+                    end
+                    cand.mirrors = mirrors
+
+                    table.insert(candidates, cand)
+                end
+            end
+        end
+
+        nextOffset = i - 1  -- where to resume on next page
+    end)
+
+    local hasMore = nextOffset < totalPhotos
+    logger:info("getCandidatesForClassification result: returned=" .. #candidates ..
+        " scanned=" .. scanned ..
+        " skippedHasSource=" .. skippedHasSource ..
+        " skippedVirtual=" .. skippedVirtual ..
+        " nextOffset=" .. nextOffset ..
+        " totalPhotos=" .. totalPhotos)
+
+    callback({
+        result = {
+            candidates = candidates,
+            count = #candidates,
+            scanned = scanned,
+            skippedHasSource = skippedHasSource,
+            skippedVirtual = skippedVirtual,
+            nextOffset = nextOffset,
+            totalPhotos = totalPhotos,
+            hasMore = hasMore,
+        }
+    })
+end
+
+-- Apply pre-computed classifications. Each classification stamps
+-- `<sourceKeyword>` and `classifier:<version>` on the photo, mirroring to
+-- listed sibling photoIds. Pre-creates required keywords once with
+-- includeOnExport=false so they never ride along in delivered XMP.
+--
+-- Params:
+--   classifications: array of { photoId, sourceKeyword, version, mirrors? }
+--   dryRun: bool — if true, validate and report without writing
+function CatalogModule.applyClassification(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local classifications = params and params.classifications
+    local dryRun = (params and params.dryRun) or false
+
+    if not classifications or type(classifications) ~= "table" or #classifications == 0 then
+        callback({ error = { code = "MISSING_PARAM",
+            message = "classifications array is required" } })
+        return
+    end
+
+    logger:info("applyClassification: " .. #classifications .. " items (dryRun=" .. tostring(dryRun) .. ")")
+
+    local catalog = LrApplication.activeCatalog()
+    local results = {
+        stamped = 0,
+        skipped = 0,
+        errors = 0,
+        mirrored = 0,
+        keywordsCreated = 0,
+        details = {},
+    }
+
+    -- Collect every keyword name we need — source classes used in this batch
+    -- plus the version markers.
+    local neededKeywords = {}
+    for _, cls in ipairs(classifications) do
+        if cls.sourceKeyword then neededKeywords[cls.sourceKeyword] = true end
+        if cls.version then neededKeywords["classifier:" .. cls.version] = true end
+    end
+
+    if dryRun then
+        -- Validate and report — no writes. Walk candidates, count what would
+        -- happen, surface the class distribution.
+        local distribution = {}
+        local existingMap = {}
+        catalog:withReadAccessDo(function()
+            local function buildMap(keywords)
+                for _, kw in ipairs(keywords) do
+                    local n = kw:getName()
+                    if neededKeywords[n] then existingMap[n] = true end
+                    local children = kw:getChildren()
+                    if children and #children > 0 then buildMap(children) end
+                end
+            end
+            buildMap(catalog:getKeywords())
+
+            for _, cls in ipairs(classifications) do
+                local photo = catalog:getPhotoByLocalId(tonumber(cls.photoId))
+                if not photo then
+                    results.errors = results.errors + 1
+                else
+                    local kwNames = getPhotoKeywordNames(photo)
+                    if hasAnySourceKeyword(kwNames) then
+                        results.skipped = results.skipped + 1
+                    else
+                        results.stamped = results.stamped + 1
+                        if cls.mirrors then results.mirrored = results.mirrored + #cls.mirrors end
+                        distribution[cls.sourceKeyword] = (distribution[cls.sourceKeyword] or 0) + 1
+                    end
+                end
+            end
+        end)
+
+        local toCreate = 0
+        for n in pairs(neededKeywords) do
+            if not existingMap[n] then toCreate = toCreate + 1 end
+        end
+        results.keywordsToCreate = toCreate
+        results.distribution = distribution
+        results.dryRun = true
+        callback({ result = results })
+        return
+    end
+
+    -- Pre-create needed keywords with includeOnExport=false. createKeyword
+    -- with returnIfExists=true returns the existing keyword if present,
+    -- preserving its existing settings — so this does NOT flip user-curated
+    -- keywords like source:from-cd to includeOnExport=false.
+    local kwMap = {}  -- name -> keyword object
+    catalog:withWriteAccessDo("Phase 3 keyword warmup", function()
+        for name in pairs(neededKeywords) do
+            -- includeOnExport=false (3rd arg), returnIfExists=true (5th arg)
+            local kw = catalog:createKeyword(name, {}, false, nil, true)
+            if kw then
+                local existed = false
+                ErrorUtils.safeCall(function()
+                    -- A naive "did this exist" check: keywords created in
+                    -- this call won't yet have any photos. Best-effort,
+                    -- only used for the count metric.
+                    existed = (#kw:getPhotos()) > 0
+                end)
+                if not existed then
+                    results.keywordsCreated = results.keywordsCreated + 1
+                end
+                kwMap[name] = kw
+            else
+                logger:warn("Failed to ensure keyword: " .. name)
+            end
+        end
+    end)
+
+    -- Apply classifications. One write block for the whole batch — keeps
+    -- the classifier:vN-as-checkpoint property intact (each photo's stamp
+    -- is atomic with respect to other photos).
+    catalog:withWriteAccessDo("Phase 3 apply classifications", function()
+        for _, cls in ipairs(classifications) do
+            local photo = catalog:getPhotoByLocalId(tonumber(cls.photoId))
+            if not photo then
+                results.errors = results.errors + 1
+                table.insert(results.details, {
+                    photoId = cls.photoId,
+                    status = "photo_not_found",
+                })
+            else
+                -- Defensive double-check: if photo gained a source:* between
+                -- candidate enumeration and this write block (race or user
+                -- intervention), respect "human > classifier" and skip.
+                local kwNames = getPhotoKeywordNames(photo)
+                if hasAnySourceKeyword(kwNames) then
+                    results.skipped = results.skipped + 1
+                else
+                    local sourceKw = kwMap[cls.sourceKeyword]
+                    local versionKw = kwMap["classifier:" .. (cls.version or "v1")]
+                    if not sourceKw or not versionKw then
+                        results.errors = results.errors + 1
+                    else
+                        -- Write order: source first, version last. A crash
+                        -- mid-transaction leaves the photo recoverable
+                        -- (Phase 3 strategy doc cross-cutting #3).
+                        photo:addKeyword(sourceKw)
+                        photo:addKeyword(versionKw)
+                        results.stamped = results.stamped + 1
+
+                        -- Mirror to siblings (stack members, sibling pairs).
+                        if cls.mirrors and #cls.mirrors > 0 then
+                            for _, mid in ipairs(cls.mirrors) do
+                                local mphoto = catalog:getPhotoByLocalId(tonumber(mid))
+                                if mphoto then
+                                    -- Same defensive check on mirrors.
+                                    local mkwNames = getPhotoKeywordNames(mphoto)
+                                    if not hasAnySourceKeyword(mkwNames) then
+                                        mphoto:addKeyword(sourceKw)
+                                        mphoto:addKeyword(versionKw)
+                                        results.mirrored = results.mirrored + 1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    logger:info("applyClassification complete: stamped=" .. results.stamped ..
+        " skipped=" .. results.skipped ..
+        " mirrored=" .. results.mirrored ..
+        " errors=" .. results.errors ..
+        " keywordsCreated=" .. results.keywordsCreated)
+
+    callback({ result = results })
+end
+
 return CatalogModule

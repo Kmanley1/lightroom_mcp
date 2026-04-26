@@ -348,6 +348,9 @@ local function registerApiCommands()
     router:register("catalog.batchSetMetadataByKeyword", CatalogModule.batchSetMetadataByKeyword, "sync")
     router:register("catalog.getFolders", CatalogModule.getFolders, "sync")
     router:register("catalog.batchGetFormattedMetadata", CatalogModule.batchGetFormattedMetadata, "sync")
+    -- Phase 3: classifier stamper
+    router:register("catalog.getCandidatesForClassification", CatalogModule.getCandidatesForClassification, "sync")
+    router:register("catalog.applyClassification", CatalogModule.applyClassification, "sync")
 
     -- Preview module commands (registered as sync for catalog API access)
     Logger:info("Registering preview commands...")
