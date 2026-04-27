@@ -2073,8 +2073,8 @@ function CatalogModule.getCandidatesForClassification(params, callback)
                     ErrorUtils.safeCall(function()
                         cand.path = photo:getRawMetadata("path")
                         cand.fileFormat = photo:getRawMetadata("fileFormat")
-                        cand.cameraMake = photo:getRawMetadata("cameraMake")
-                        cand.cameraModel = photo:getRawMetadata("cameraModel")
+                        cand.cameraMake = photo:getFormattedMetadata("cameraMake")
+                        cand.cameraModel = photo:getFormattedMetadata("cameraModel")
                         cand.software = photo:getFormattedMetadata("software")
                         cand.isInStack = photo:getRawMetadata("isInStackInFolder")
                         cand.stackPosition = photo:getRawMetadata("stackPositionInFolder")
@@ -2229,21 +2229,62 @@ function CatalogModule.applyClassification(params, callback)
         return
     end
 
+    -- Resolve required top-level parents. We REQUIRE these to exist; we
+    -- do not create them. Adobe's LrC SDK has two relevant constraints:
+    --   1) createKeyword(parent=nil) does NOT reliably create at the
+    --      catalog root — it lands under whatever parent is "current
+    --      context" (often the most recently selected keyword), so we
+    --      can't trust it to make top-level parents.
+    --   2) LrKeyword has no setParent / moveKeyword API, so we can't
+    --      heal mis-placed keywords after the fact.
+    -- Therefore: the user creates the top-level "Source" and "Classifier"
+    -- keywords manually once (uncheck "Put Inside …" in LrC's Create
+    -- Keyword dialog). We look them up here and error out clearly if
+    -- they're missing.
+    local function findTopLevelByName(name)
+        for _, kw in ipairs(catalog:getKeywords()) do
+            if kw:getName() == name then return kw end
+        end
+        return nil
+    end
+    local sourceParent = findTopLevelByName("Source")
+    local classifierParent = findTopLevelByName("Classifier")
+    if not sourceParent then
+        callback({ error = { code = "MISSING_PARENT_KEYWORD",
+            message = "Top-level keyword 'Source' not found. Create it in LrC's Keyword List panel (uncheck 'Put Inside ...' to make it top-level), then re-run.",
+            severity = "error" } })
+        return
+    end
+    if not classifierParent then
+        callback({ error = { code = "MISSING_PARENT_KEYWORD",
+            message = "Top-level keyword 'Classifier' not found. Create it in LrC's Keyword List panel (uncheck 'Put Inside ...' to make it top-level), then re-run.",
+            severity = "error" } })
+        return
+    end
+
     -- Pre-create needed keywords with includeOnExport=false. createKeyword
-    -- with returnIfExists=true returns the existing keyword if present,
-    -- preserving its existing settings — so this does NOT flip user-curated
-    -- keywords like source:from-cd to includeOnExport=false.
+    -- with returnIfExists=true returns the existing keyword if present
+    -- under the specified parent, preserving its settings — so this does
+    -- NOT flip user-curated keywords like source:from-cd to
+    -- includeOnExport=false. Note: returnIfExists is parent-scoped, so
+    -- specifying the right parent is essential to avoid duplicates.
     local kwMap = {}  -- name -> keyword object
     catalog:withWriteAccessDo("Phase 3 keyword warmup", function()
+        local function desiredParentFor(name)
+            if name:sub(1, 7) == "source:" then return sourceParent end
+            if name:sub(1, 11) == "classifier:" then return classifierParent end
+            return nil
+        end
+
         for name in pairs(neededKeywords) do
+            local desiredParent = desiredParentFor(name)
             -- includeOnExport=false (3rd arg), returnIfExists=true (5th arg)
-            local kw = catalog:createKeyword(name, {}, false, nil, true)
+            local kw = catalog:createKeyword(name, {}, false, desiredParent, true)
             if kw then
                 local existed = false
                 ErrorUtils.safeCall(function()
-                    -- A naive "did this exist" check: keywords created in
-                    -- this call won't yet have any photos. Best-effort,
-                    -- only used for the count metric.
+                    -- Heuristic: keywords created in this call won't yet
+                    -- have photos. Best-effort, only used for the count.
                     existed = (#kw:getPhotos()) > 0
                 end)
                 if not existed then
