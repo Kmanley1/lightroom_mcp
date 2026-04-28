@@ -168,6 +168,82 @@ class TestPathHeuristics:
         assert classify_one(c).source_keyword == SOURCE_WEB
 
 
+class TestPreDigitalYearFolder:
+    """v1.1: photos in pre-2003 year folders without EXIF → source:scanned."""
+
+    def test_1993_year_folder_no_exif(self):
+        c = _candidate(
+            filename="1993.07.04.jpg",
+            path="C:/_/main/Photos/Ken/1993/1993.07.04 12.00.00 PM.jpg",
+        )
+        result = classify_one(c)
+        assert result.source_keyword == SOURCE_SCANNED
+        assert "pre-digital-year-folder" in result.signals
+
+    def test_1993_year_month_folder_no_exif(self):
+        c = _candidate(
+            filename="img.jpg",
+            path="C:/_/main/Photos/Ken/1993/1993-01/img.jpg",
+        )
+        assert classify_one(c).source_keyword == SOURCE_SCANNED
+
+    def test_2002_boundary_no_exif(self):
+        # 2002 is the last year covered by the rule.
+        c = _candidate(filename="img.jpg", path="/photos/2002/img.jpg")
+        assert classify_one(c).source_keyword == SOURCE_SCANNED
+
+    def test_2003_boundary_falls_through(self):
+        # 2003 is the first year NOT covered — should fall through to
+        # the unclassified default (no other signal here).
+        c = _candidate(filename="img.jpg", path="/photos/2003/img.jpg")
+        assert classify_one(c).source_keyword == SOURCE_UNCLASSIFIED
+
+    def test_2024_falls_through(self):
+        c = _candidate(filename="img.jpg", path="/photos/2024/img.jpg")
+        assert classify_one(c).source_keyword == SOURCE_UNCLASSIFIED
+
+    def test_exif_beats_year_folder(self):
+        # Misfiled digital photo: 2015 capture in a 1995 folder. EXIF
+        # wins per precedence — we trust the camera over the folder.
+        c = _candidate(
+            filename="img.jpg",
+            path="C:/_/main/Photos/Ken/1995/img.jpg",
+            make="NIKON CORPORATION",
+            model="NIKON D750",
+        )
+        assert classify_one(c).source_keyword == SOURCE_CAPTURE
+
+    def test_year_in_filename_only_does_not_match(self):
+        # Year token appears only in the filename, not as a folder
+        # component. Must NOT trigger the rule.
+        c = _candidate(
+            filename="Hawaii-1995-vacation.jpg",
+            path="/Users/ken/Pictures/Hawaii-1995-vacation.jpg",
+        )
+        assert classify_one(c).source_keyword == SOURCE_UNCLASSIFIED
+
+    def test_windows_backslash_separators(self):
+        c = _candidate(
+            filename="img.jpg",
+            path="C:\\_\\main\\Photos\\Ken\\1993\\img.jpg",
+        )
+        assert classify_one(c).source_keyword == SOURCE_SCANNED
+
+    def test_scanner_software_beats_year_folder(self):
+        # Scanner software runs at precedence #2, year folder at #5.
+        # Scanner wins (consistent with stronger-signal-first design).
+        c = _candidate(
+            filename="img.jpg",
+            path="/photos/1993/img.jpg",
+            software="VueScan 9.7",
+        )
+        result = classify_one(c)
+        assert result.source_keyword == SOURCE_SCANNED
+        # Both rules emit SOURCE_SCANNED, but the signal must show
+        # which one fired — scanner-software, not pre-digital-year.
+        assert any("scanner-software" in s for s in result.signals)
+
+
 class TestAmbiguousFallback:
     """No strong signal → source:unclassified, surfaces for review."""
 

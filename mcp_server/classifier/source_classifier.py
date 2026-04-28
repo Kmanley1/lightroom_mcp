@@ -5,13 +5,22 @@ Maps photos to source-taxonomy classes per
 
 Precedence (taxonomy doc Open Question 1, locked for v1):
 
-    1. video extension       → source:video        (v1 placeholder per Video v1 Policy)
-    2. scanner software tag  → source:scanned
-    3. screenshot filename   → source:screenshot
-    4. EXIF Make/Model       → source:capture
-    5. messaging-dir path    → source:received
-    6. download-dir path     → source:web
-    7. otherwise             → source:unclassified
+    1. video extension          → source:video      (Video v1 Policy)
+    2. scanner software tag     → source:scanned
+    3. screenshot filename      → source:screenshot
+    4. EXIF Make/Model          → source:capture
+    5. pre-2003 year folder     → source:scanned    (v1.1 path rule)
+    6. messaging-dir path       → source:received
+    7. download-dir path        → source:web
+    8. otherwise                → source:unclassified
+
+The pre-2003 year-folder rule (v1.1) catches the 1990s/early-2000s
+archive: photos that lack EXIF Make/Model AND live in a path
+component matching ``19\\d\\d`` or ``200[0-2]`` are almost certainly
+scans. Personal digital cameras displaced film around 2003, so any
+EXIF-less photo in a pre-2003 year folder is a scanned print or
+negative. The rule slots AFTER EXIF capture so digital photos
+misfiled into a 1995 folder still classify correctly.
 
 Note: the existing user-facing convention "no source keyword = real photo"
 is extended in v1 with an explicit ``source:capture`` keyword. The classifier
@@ -83,6 +92,17 @@ DOWNLOAD_DIR_TOKENS = (
 _SCREENSHOT_FILENAME_RE = re.compile(
     r"^screen[\s_-]*shot[\s_\-:.]",
     re.IGNORECASE,
+)
+
+
+# Pre-digital-era year-folder pattern (v1.1). Matches a path component
+# that IS a 4-digit year in [1900, 2002], OR begins with such a year
+# followed by "-" (year-month folders like "1993-01"). The component
+# must be bounded by a path separator on the left to avoid matching
+# years embedded in filenames (e.g., "Hawaii-1995.jpg" must NOT match
+# but ".../1995/Hawaii.jpg" must).
+_PRE_DIGITAL_YEAR_RE = re.compile(
+    r"[\\/](?:19\d\d|200[0-2])(?:[\\/\-]|$)"
 )
 
 
@@ -175,6 +195,15 @@ def _path_has_token(c: CandidatePhoto, tokens) -> bool:
     return any(t in p for t in tokens)
 
 
+def _has_pre_digital_year_folder(c: CandidatePhoto) -> bool:
+    """True if the path contains a folder component in the pre-digital
+    era (1900-2002). Used as a fallback signal for scanned material
+    that lacks EXIF Make/Model."""
+    if not c.path:
+        return False
+    return bool(_PRE_DIGITAL_YEAR_RE.search(c.path))
+
+
 def classify_one(c: CandidatePhoto) -> Classification:
     """Classify a single photo. Precedence order is load-bearing — see
     module docstring for the locked v1 ordering."""
@@ -195,6 +224,13 @@ def classify_one(c: CandidatePhoto) -> Classification:
     if _is_capture(c):
         signals.append(f"exif-camera:{(c.make or '').strip()}/{(c.model or '').strip()}")
         return Classification(c.photo_id, SOURCE_CAPTURE, signals=signals)
+
+    # v1.1 path rule: photos in pre-2003 year folders without EXIF
+    # are almost certainly scans. Slots after EXIF so digital photos
+    # misfiled into a year folder still classify as capture.
+    if _has_pre_digital_year_folder(c):
+        signals.append("pre-digital-year-folder")
+        return Classification(c.photo_id, SOURCE_SCANNED, signals=signals)
 
     if _path_has_token(c, MESSAGING_DIR_TOKENS):
         signals.append("messaging-dir")
